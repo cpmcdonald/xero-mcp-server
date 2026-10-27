@@ -1,5 +1,6 @@
 import axios, { AxiosError } from "axios";
 import dotenv from "dotenv";
+import fs from "fs";
 import {
   IXeroClientConfig,
   Organisation,
@@ -14,6 +15,7 @@ dotenv.config();
 const client_id = process.env.XERO_CLIENT_ID;
 const client_secret = process.env.XERO_CLIENT_SECRET;
 const bearer_token = process.env.XERO_CLIENT_BEARER_TOKEN;
+const token_file = process.env.XERO_TOKEN_FILE;
 const grant_type = "client_credentials";
 
 if (!bearer_token && (!client_id || !client_secret)) {
@@ -220,12 +222,131 @@ class BearerTokenXeroClient extends MCPXeroClient {
   }
 }
 
+class RefreshTokenXeroClient extends MCPXeroClient {
+  private readonly clientId: string;
+  private readonly clientSecret: string;
+  private readonly tokenFile: string;
+  // Refresh a minute early so a token doesn't expire mid-request
+  private readonly EXPIRY_MARGIN_SECONDS = 60;
+  private refreshInFlight: Promise<TokenSet> | null = null;
+
+  constructor(config: {
+    clientId: string;
+    clientSecret: string;
+    tokenFile: string;
+  }) {
+    super();
+    this.clientId = config.clientId;
+    this.clientSecret = config.clientSecret;
+    this.tokenFile = config.tokenFile;
+  }
+
+  private readTokens(): TokenSet {
+    try {
+      return JSON.parse(fs.readFileSync(this.tokenFile, "utf8"));
+    } catch (error: unknown) {
+      const err = ensureError(error);
+      throw new Error(
+        `Failed to read Xero token file ${this.tokenFile}: ${err.message}`,
+      );
+    }
+  }
+
+  private writeTokens(tokens: TokenSet): void {
+    // Write to a temp file then rename so a crash can't leave a half-written file
+    const tempFile = `${this.tokenFile}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(tokens, null, 2), {
+      mode: 0o600,
+    });
+    fs.renameSync(tempFile, this.tokenFile);
+  }
+
+  private isExpired(tokens: TokenSet): boolean {
+    if (!tokens.expires_at) return true;
+    const now = Math.floor(Date.now() / 1000);
+    return tokens.expires_at - this.EXPIRY_MARGIN_SECONDS <= now;
+  }
+
+  private async refreshTokens(refreshToken: string): Promise<TokenSet> {
+    const credentials = Buffer.from(
+      `${this.clientId}:${this.clientSecret}`,
+    ).toString("base64");
+
+    try {
+      const response = await axios.post(
+        "https://identity.xero.com/connect/token",
+        `grant_type=refresh_token&refresh_token=${encodeURIComponent(refreshToken)}`,
+        {
+          headers: {
+            Authorization: `Basic ${credentials}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+            Accept: "application/json",
+          },
+        },
+      );
+
+      const tokens: TokenSet = {
+        ...response.data,
+        expires_at:
+          Math.floor(Date.now() / 1000) + Number(response.data.expires_in),
+      };
+      // Xero rotates the refresh token, so the new one must be saved
+      this.writeTokens(tokens);
+      return tokens;
+    } catch (error) {
+      const axiosError = error as AxiosError;
+      const data = axiosError.response?.data;
+      const message =
+        typeof data === "object" ? JSON.stringify(data) : data || axiosError.message;
+      throw new Error(
+        `Failed to refresh Xero token (you may need to re-authorise): ${message}`,
+      );
+    }
+  }
+
+  async authenticate(): Promise<void> {
+    // Re-read each time so tokens refreshed by another process are picked up
+    let tokens = this.readTokens();
+
+    if (this.isExpired(tokens)) {
+      if (!tokens.refresh_token) {
+        throw new Error(
+          `Xero token in ${this.tokenFile} has expired and has no refresh_token`,
+        );
+      }
+      // Share one refresh between concurrent tool calls, since each refresh
+      // rotates the refresh token
+      this.refreshInFlight ??= this.refreshTokens(tokens.refresh_token).finally(
+        () => {
+          this.refreshInFlight = null;
+        },
+      );
+      tokens = await this.refreshInFlight;
+    }
+
+    this.setTokenSet({
+      access_token: tokens.access_token,
+      token_type: tokens.token_type,
+    });
+
+    if (!this.tenantId) {
+      await this.updateTenants();
+    }
+  }
+}
+
 export const xeroClient = bearer_token
   ? new BearerTokenXeroClient({
       bearerToken: bearer_token,
     })
-  : new CustomConnectionsXeroClient({
-      clientId: client_id!,
-      clientSecret: client_secret!,
-      grantType: grant_type,
-    });
+  : token_file
+    ? new RefreshTokenXeroClient({
+        clientId: client_id!,
+        clientSecret: client_secret!,
+        tokenFile: token_file,
+      })
+    : new CustomConnectionsXeroClient({
+        clientId: client_id!,
+        clientSecret: client_secret!,
+        grantType: grant_type,
+      });

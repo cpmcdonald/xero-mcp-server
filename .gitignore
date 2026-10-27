@@ -142,3 +142,8 @@ dist
 
 # Cursor IDE
 .cursor/
+
+# Local Xero OAuth secrets
+tokens.json
+tokens.json.tmp
+.env_2

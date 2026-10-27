@@ -134,6 +134,30 @@ payroll.employees
 payroll.timesheets
 ```
 
+#### 3. Token File (auto-refreshing)
+
+Use this if you've completed a standard OAuth 2.0 authorisation code flow yourself and have a token set that includes a `refresh_token` (requires the `offline_access` scope). Bearer tokens expire after 30 minutes, so instead of passing one in, point the server at a JSON file holding the token set. Before each request the server checks `expires_at`, refreshes the token if it's within a minute of expiring, and writes the new token set (including the rotated refresh token) back to the file.
+
+```json
+{
+  "mcpServers": {
+    "xero": {
+      "command": "npx",
+      "args": ["-y", "@xeroapi/xero-mcp-server@latest"],
+      "env": {
+        "XERO_CLIENT_ID": "your_client_id_here",
+        "XERO_CLIENT_SECRET": "your_client_secret_here",
+        "XERO_TOKEN_FILE": "/absolute/path/to/tokens.json"
+      }
+    }
+  }
+}
+```
+
+The file must contain at least `access_token`, `refresh_token` and `expires_at` (Unix seconds), as saved by `xero-node`'s `apiCallback()`. If the refresh token itself expires (60 days unused), re-run your authorisation flow to regenerate the file.
+
+NOTE: `XERO_CLIENT_BEARER_TOKEN` takes precedence over `XERO_TOKEN_FILE` if both are defined.
+
 
 ### Available MCP Commands
 
